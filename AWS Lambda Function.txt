@@ -1,0 +1,279 @@
+# Import necessary libraries
+import os
+import io
+import boto3
+import json
+import csv
+import pandas as pd
+from pandasql import sqldf
+from io import StringIO
+import time
+
+# Retrieve environment variables
+ENDPOINT_NAME = os.environ['ENDPOINT_NAME']
+runtime= boto3.client('runtime.sagemaker')
+
+# Define some ANSI escape sequences for formatting output
+newline, bold, unbold = "\n", "\033[1m", "\033[0m"
+
+
+# Function to query a SageMaker endpoint
+def query_endpoint(encoded_text, endpoint_name):
+    client = boto3.client("runtime.sagemaker")
+    response = client.invoke_endpoint(
+        EndpointName=endpoint_name, ContentType="application/x-text", Body=encoded_text
+    )
+    return response
+
+# Function to parse the response from a SageMaker endpoint
+def parse_response(query_response):
+    model_predictions = json.loads(query_response["Body"].read())
+    generated_text = model_predictions["generated_text"]
+    return generated_text
+
+# Function to generate a table prompt based on user input and get table name
+def table_generator(inputTranscript):
+    table_prompt= inputTranscript + ''' " , please consider the following and tell which table should I use: 
+'hanz_sales' table: This table is designed to store daily sales data of different cement materials in New Zealand. It includes key columns such as 'Material,' 'Ship-to,' 'Material-Description,' 'Ship-to party,' 'Delivery Date,' 'Reported Quantity,' and 'Quantity Unit in Tons.' While it provides insights into sales activities, it may not be the most suitable for detailed information about delivered orders. 
+'au_rmx' table: This table, part of the 'datalake_with_billings' database in the 'athenadb' channel, serves as a comprehensive repository of billing, customer, material, and sales data. It includes details such as billing document numbers, billing dates, customer codes and names, material descriptions, quantities ordered, manufacturing plant information, sales values, freight details, account manager assignments, sales office specifics, and significant dates like delivery and order creation. This table offers a detailed snapshot of transactions and interactions, making it a valuable resource for understanding various aspects of business operations related to billing and sales.
+                 '''
+    for text in [table_prompt]:
+        query_response = query_endpoint(text.encode("utf-8"), endpoint_name=ENDPOINT_NAME)
+        table_name = parse_response(query_response)
+        print(table_name)
+    
+    return table_name         
+
+# Function to generate SQL queries based on the chosen table
+def sql_generator(inputTranscript):
+    
+    table_name=table_generator(inputTranscript)
+
+    prompt_hanz_sales="""The schema of the table is as below in {} brackets.
+              {"table": "hanz_sales",
+              "table_description": "It is designed to store daily sales data of different cement materials in New Zealand. The table contains several key columns, including 'Material' for various types of cement material codes, 'Ship-to' for customer codes, 'Material-Description' for detailed material descriptions, and 'Ship-to party' for customer descriptions. Additionally, it tracks important transaction information such as 'Delivery Date' (Del.Date), 'Reported Quantity' (Rpt Qty), and the unit of measurement for quantity, indicated by 'Quantity Unit in Tons' (Reporting UOM). This schema provides essential insights into the sales activities, allowing for a comprehensive analysis of cement material sales in the specified region.",
+              "columns": [
+                              ["Material": "The various types of cement material type code"],
+                              ["Ship-to": "The customer Codes"],
+                              ["Material-Description": "Material Description"],
+                              ["Ship-to party": "Customer description"],
+                              ["Del.Date": "Delivery Date"],
+                              ["Rpt Qty": "Reported Quantity]",
+                              ["Reporting UOM": "contains value T where Quantity of Unit is Tons"]
+                        ]
+              }
+              Question 1:  What is the total reported quantity for the material '520110'?
+              Answer 1: The query should be "SELECT SUM("Rpt Qty") AS total_reported_quantity FROM hanz_sales WHERE "Material" = '520110';"
+              Question 2: How many unique ship-to parties are there in the sales data? 
+              Answer 2: The query should be "SELECT COUNT(*) AS order_count FROM hanz_sales WHERE "Del.Date" = '2022-01-05';"
+              Question 3: What is the total reported quantity for orders delivered in January 2022? 
+              Answer 3: SELECT SUM("Rpt Qty") AS total_reported_quantity FROM hanz_sales WHERE strftime('%Y', "Del.Date") = '2022' AND strftime('%m', "Del.Date") = '01'; 
+              Question 4: How many orders were delivered for each reporting unit of measure (UOM)?
+              Answer 4: SELECT "Reporting UOM", COUNT(*) AS order_count FROM hanz_sales GROUP BY "Reporting UOM"; 
+              Question 5: How many orders were delivered for each ship-to party where the delivery date is in January 2022 and the reported quantity is greater than 10 tons? 
+              Answer 5: SELECT "Ship-to party", COUNT(*) AS order_count FROM hanz_sales WHERE strftime('%Y', "Del.Date") = '2022' AND strftime('%m', "Del.Date") = '01' AND "Rpt Qty" > 10 GROUP BY "Ship-to party"; 
+              Question 6:  What is the total reported quantity for each ship-to party where the reported quantity is less than 1 ton?  
+              Answer 6: SELECT "Ship-to party", SUM("Rpt Qty") AS total_reported_quantity FROM hanz_sales WHERE "Rpt Qty" [less than] 1 GROUP BY "Ship-to party"; 
+              Question 7: What is the total reported quantity for each ship-to party where the reported quantity is less than and equal to 1 ton?  
+              Answer 7: SELECT "Ship-to party", SUM("Rpt Qty") AS total_reported_quantity FROM hanz_sales WHERE "Rpt Qty" [less than equal to] 1 GROUP BY "Ship-to party"; 
+              In a Similar way answer generate a SQL query to """ + inputTranscript
+              
+    prompt_au_rmx="""The schema of the table is as below in {} brackets.
+              {"table": "au_rmx",
+              "table_description": "Table containing billing, customer, material, and sales information, including details such as billing document number, billing date, customer code and name, material description, quantity ordered, plant manufactured, sales value, freight details, account manager, sales office information, and important dates like delivery and order creation.",
+              "columns": [
+                              ["billing_document": "billing /invoice document number"],
+                              ["billing_date": "date when the order was billed"],
+                              ["ship_to": "customer code"],
+                              ["ship_to_name": "customer name"],
+                              ["ship_to_region": "customer region"],
+                              ["material": "material brought by the customer]",
+                              ["quantity": "quantity ordered"],
+                              ["plant": "plant manufactured"],
+                              ["plant_name": "plant name"],
+                              ["plant_region": "plant region"],
+                              ["sales_net_value": "sales value of the material"],
+                              ["freight_net_value": "freight value of the material"],
+                              ["freight_revenue": "freight revenue of the material"],
+                              ["material_description": "material description"],
+                              ["cost": "cost of the material"],
+                              ["account_manager": "account manager"],
+                              ["sales_office": "sales office id"],
+                              ["sales_office_desc": "sales office name"],
+                              ["del_date": "delivery date"],
+                              ["ord_create": "order date"]
+                        ]
+              }
+              Question 1: What is the total sales value for the orders billed on January 6, 2025?
+              Answer 1: SELECT SUM(sales_net_value) AS total_sales_value FROM au_rmx WHERE billing_date = '2025-01-06';
+              Question 2: Which orders have a delivery date in the year 2025?
+              Answer 2: SELECT * FROM au_rmx WHERE strftime('%Y', del_date) = '2025'; 
+              Question 3: Which orders have a billing date in January 2025 and a delivery date in February 2025? 
+              Answer 3: SELECT * FROM au_rmx WHERE strftime('%Y', billing_date) = '2025' AND strftime('%m', billing_date) = '01' AND strftime('%Y', del_date) = '2025' AND strftime('%m', del_date) = '02'; 
+              Question 4: Which sales office had the highest total sales value? 
+              Answer 4: SELECT sales_office_desc FROM au_rmx GROUP BY sales_office_desc ORDER BY SUM(sales_net_value) DESC LIMIT 1; 
+              Question 5: What is the total quantity of material ordered by each customer? 
+              Answer 5: SELECT ship_to_name, SUM(quantity) AS total_quantity_ordered FROM au_rmx GROUP BY ship_to_name;
+              Question 6: How many orders have a delivery date before their order date or same as order? 
+              Answer 6: SELECT COUNT(*) AS order_count FROM au_rmx WHERE del_date [less than equal to] ord_create;
+              Question 7: How many orders have a delivery date before their order date? 
+              Answer 7: SELECT COUNT(*) AS order_count FROM au_rmx WHERE del_date [less than] ord_create;
+              In a Similar way answer generate a SQL query to """ + inputTranscript
+                  
+    if table_name=='hanz_sales':
+        prompt=prompt_hanz_sales
+    elif table_name=='au_rmx':
+        prompt=prompt_au_rmx
+    else:
+        prompt=prompt_au_rmx
+        table_name='au_rmx'
+
+    for text in [prompt]:
+        query_response = query_endpoint(text.encode("utf-8"), endpoint_name=ENDPOINT_NAME)
+        generated_sql = parse_response(query_response)
+        print(generated_sql)
+    
+    return generated_sql
+    
+# Function to retrieve insights from the database using the generated SQL query
+def insight(inputTranscript, generated_sql,table_name):
+    # Initialize Boto3 S3 client
+    s3_client = boto3.client('s3')
+    # Specify your S3 bucket name and file key
+    bucket_name = 'holcimdatabase'
+    if table_name=='hanz_sales':
+        file_key = 'hanz-sales - sample.csv'  # Update with the path to your file in the bucket
+    elif table_name=='au_rmx':
+        file_key='au_rmx - sample.csv'
+    else:
+        file_key='au_rmx - sample.csv'
+        
+    # Get object from S3
+    response = s3_client.get_object(Bucket=bucket_name, Key=file_key)
+    # Read the content of the file as a Pandas DataFrame
+    content = response['Body'].read()
+    df = pd.read_csv(StringIO(content.decode('utf-8')))
+    # Create a DataFrame with a name based on table_name
+    globals()[table_name] = df
+    
+    # Define your SQL query
+    print(generated_sql)
+    sql_query = generated_sql
+    # Execute the SQL query on the DataFrame
+    #result = sqldf(sql_query, locals())
+    result = sqldf(sql_query, globals())
+    # Print the result
+    print(result)
+    # Convert the result to JSON
+    json_result = result.to_json(orient = 'split',index=False)
+    # Print the JSON result
+    print(json_result)
+    
+    text = "Give one line summary of data output for a question asked by sales person basis information:" + \
+            " Question:" + inputTranscript + \
+          " Answer:" + json_result
+
+    
+    print(text)
+    
+    for text in [text]:
+        query_response = query_endpoint(text.encode("utf-8"), endpoint_name=ENDPOINT_NAME)
+        insight_generated = parse_response(query_response)
+        print(insight_generated)
+    
+    
+    return table_name,generated_sql,json_result,insight_generated
+    
+# Function to validate input slots
+def validate(slots):
+    
+     #if not slots.get('Type'):
+     #    print("What is your material type?")
+     #    return {
+     #    'isValid': False,
+     #    'violatedSlot': 'Type'
+                 
+    return {'isValid': True}
+    
+
+# Lambda handler function
+def lambda_handler(event, context):
+    start_time = time.time()  # Record the start time
+
+    # Extract relevant information from the Lambda event
+    invocation_source = event.get('invocationSource')
+    slots = event.get('sessionState', {}).get('intent', {}).get('slots', {})
+    intent = event.get('sessionState', {}).get('intent', {}).get('name')
+    inputTranscript = event.get('inputTranscript')
+
+    # Validate input slots if invoked during dialog
+    validation_result = validate(slots)
+    if invocation_source == 'DialogCodeHook':
+        if not validation_result['isValid']:
+            # Return response to elicit the violated slot
+            response = {
+                "sessionState": {
+                    "dialogAction": {
+                        'slotToElicit':validation_result['violatedSlot'],
+                        "type": "ElicitSlot"
+                    },
+                    "intent": {
+                        'name':intent,
+                        'slots':slots
+                        
+                        }
+                }
+              } 
+               
+         # Return response to delegate to the fulfillment code hook
+        else:
+                response = {
+                "sessionState": {
+                    "dialogAction": {
+                        "type": "Delegate"
+                    },
+                    "intent": {
+                        'name':intent,
+                        'slots': slots
+                        
+                        }
+            
+                }
+            }
+        return response 
+
+
+    # Generate SQL queries, retrieve insights, and print the final output
+    table_name,generated_sql,json_result,insight_generated = insight(inputTranscript,generated_sql,table_name)
+    
+
+
+    FinalOutput = f"""
+                Insight Generated: {insight_generated} \
+                """
+
+    # Handle fulfillment code hook
+    if event['invocationSource'] == 'FulfillmentCodeHook':
+
+        response = {
+        "sessionState": {
+            "dialogAction": {
+                "type": "Close"
+            },
+            "intent": {
+                'name':intent,
+                'slots': slots,
+                'state':'Fulfilled'
+                
+                }
+    
+        },
+        "messages": [
+            {
+                "contentType": "PlainText",
+                "content": FinalOutput
+            }
+        ]
+    }
+
+    return response 
